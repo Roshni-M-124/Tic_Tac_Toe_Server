@@ -1,0 +1,36 @@
+.container {
+    text-align: center;
+}
+
+.board {
+    width: 320px;
+    margin: auto;
+}
+
+.cell {
+    width: 100px;
+    height: 100px;
+    background: lightgray;
+    border: 1px solid black;
+    display: inline-block;
+    line-height: 100px;
+    font-size: 36px;
+    cursor: pointer;
+    vertical-align: top;
+}
+
+#player {
+    color: red;
+    font-weight: bold;
+}
+
+#message {
+    color: green;
+    font-weight: bold;
+}
+
+button {
+    margin-top: 20px;
+    font-size: 18px;
+}
+
