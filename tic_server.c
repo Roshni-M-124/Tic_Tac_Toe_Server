@@ -1,12 +1,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
+#include <sys/timerfd.h>
 #include <netdb.h>
 #include <openssl/sha.h>
 #include <openssl/evp.h>
@@ -16,8 +18,10 @@
 #define BUF_SIZE 1000
 #define BACKLOG 100
 #define MAX_ALLOWED 8000
+#define EVENT_LISTENER 0
+#define EVENT_PLAYER 1
+#define EVENT_TIMER  2
 
-int handshake_done[10000] = {0};
 typedef struct Player Player;
 
 typedef struct Game {
@@ -30,10 +34,12 @@ typedef struct Game {
 }Game;
 
 typedef struct Player {
+    int type;
     int player_fd; 
     char symbol;
     Game *game;
-    int enqueued; 
+    int enqueued;
+    int handshake_done; 
 }Player;
 
 typedef struct WaitingPlayer {
@@ -41,14 +47,23 @@ typedef struct WaitingPlayer {
     struct WaitingPlayer *next;
 } WaitingPlayer;
 
+typedef struct TimerEvent {
+    int type;
+    int timer_fd;
+    Player *player;
+} TimerEvent;
+
+typedef struct Listener {
+    int type;
+    int sockfd;
+} Listener;
+
 static Game *game_head = NULL;
 static WaitingPlayer *queue_head = NULL;
 static WaitingPlayer *queue_tail = NULL;
-Player *players[10000] = {0};
 
-void send_text_frame(int client_fd, const char *msg)
-{
-
+void send_text_frame(int client_fd, const char *msg){
+    
     unsigned char frame[BUF_SIZE];
     size_t len = strlen(msg);
     frame[0] = 0x81; // 1000 0001
@@ -66,9 +81,8 @@ void send_text_frame(int client_fd, const char *msg)
     }
 }
 
+void broadcast_board(Game *game){
 
-void broadcast_board(Game *game)
-{
     char msg[512];
     snprintf(msg, sizeof(msg), "{\"type\":\"update\",\"board\":[\"%c\",\"%c\",\"%c\",\"%c\",\"%c\",\"%c\",\"%c\",\"%c\",\"%c\"]}", game->board[0], game->board[1], game->board[2], game->board[3], game->board[4], game->board[5], game->board[6], game->board[7], game->board[8]);
     if (game->player1 && game->player1->player_fd)
@@ -77,8 +91,8 @@ void broadcast_board(Game *game)
         send_text_frame(game->player2->player_fd, msg);
 }
 
-char check_winner(Game *game)
-{
+char check_winner(Game *game){
+
     int wins[8][3] = {
         {0,1,2},{3,4,5},{6,7,8},
         {0,3,6},{1,4,7},{2,5,8},
@@ -97,8 +111,8 @@ char check_winner(Game *game)
     return ' ';
 }
 
-int is_draw(Game *game)
-{
+int is_draw(Game *game){
+
     for (int i = 0; i < 9; i++)
     {
         if (game->board[i] == ' ')
@@ -107,8 +121,8 @@ int is_draw(Game *game)
     return 1;
 }
 
-void remove_game(Game *game)
-{
+void remove_game(Game *game){
+
     Game **curr = &game_head;
     while (*curr)
     {
@@ -121,8 +135,8 @@ void remove_game(Game *game)
     }
 }
 
-Player *dequeue_player()
-{
+Player *dequeue_player(){
+
     if (!queue_head)
         return NULL;
     WaitingPlayer *node = queue_head;
@@ -135,8 +149,8 @@ Player *dequeue_player()
     return p;
 }
 
-void match_players()
-{
+void match_players(){
+
     while (queue_head && queue_head->next)
     {
         Player *p1 = dequeue_player();
@@ -160,8 +174,8 @@ void match_players()
     }
 }
 
-void enqueue_player(Player *p)
-{
+void enqueue_player(Player *p){
+
     if (p->enqueued) 
         return; 
     WaitingPlayer *node = malloc(sizeof(WaitingPlayer));
@@ -177,8 +191,8 @@ void enqueue_player(Player *p)
     p->enqueued = 1;
 }
 
-void remove_from_queue(Player *p)
-{
+void remove_from_queue(Player *p){
+
     WaitingPlayer **curr = &queue_head;
     WaitingPlayer *prev = NULL;
     while (*curr)
@@ -212,6 +226,204 @@ void generate_websocket_accept_key(const char *client_key, char *accept_key)
     snprintf(combined, sizeof(combined), "%s%s", client_key, magic_string);
     SHA1((unsigned char *)combined, strlen(combined), sha1);
     EVP_EncodeBlock((unsigned char *)accept_key, sha1, SHA_DIGEST_LENGTH);
+}
+
+void accept_connections(int sockfd, int epfd){
+    struct epoll_event ev;
+    while (1) {
+        struct sockaddr_storage client_addr;
+        socklen_t addr_len = sizeof client_addr;
+        int client_fd = accept(sockfd, (struct sockaddr *)&client_addr, &addr_len);
+        if (client_fd == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
+            else {
+                perror("accept");
+                break;
+            }
+        }
+        make_socket_non_blocking(client_fd);
+        printf("New client connected: %d\n\n", client_fd);
+        Player *p = malloc(sizeof(Player));
+        memset(p, 0, sizeof(Player));
+        p->type = EVENT_PLAYER;
+        p->player_fd = client_fd;
+        p->game = NULL;
+        p->symbol = ' ';
+        p->enqueued = 0;
+        p->handshake_done = 0;
+        ev.events = EPOLLIN;
+        ev.data.ptr = p;
+        epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &ev);
+    }
+}
+
+void handle_disconnect(Player *p, int epfd){
+    
+    if (!p)
+        return;
+    if (p->game) {
+        Game *g = p->game;
+        Player *opponent = (g->player1 == p) ? g->player2 : g->player1;
+        if (opponent) {
+            send_text_frame(opponent->player_fd, 
+                "{\"type\":\"opponent_left\"}");
+            opponent->game = NULL;
+            opponent->symbol = ' ';
+            opponent->enqueued = 0;
+            int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+            if (tfd == -1) {
+                perror("timerfd_create");
+                return;
+            }
+            struct itimerspec ts;
+            memset(&ts, 0, sizeof(ts));
+            ts.it_value.tv_sec = 2;   
+            timerfd_settime(tfd, 0, &ts, NULL);
+            TimerEvent *te = malloc(sizeof(TimerEvent));
+            te->type = EVENT_TIMER;
+            te->timer_fd = tfd;
+            te->player = opponent;
+            struct epoll_event ev;
+            ev.events = EPOLLIN;
+            ev.data.ptr = te;
+            epoll_ctl(epfd, EPOLL_CTL_ADD, tfd, &ev);
+        }
+        remove_game(g);
+        free(g);
+        match_players();
+    }
+    remove_from_queue(p);
+    epoll_ctl(epfd, EPOLL_CTL_DEL, p->player_fd, NULL);
+    close(p->player_fd);
+    p->handshake_done = 0;
+    free(p);
+}
+
+void handle_handshake(Player *p, unsigned char *buf){
+
+    if (strstr((char *)buf,"Connection: Upgrade") && strstr((char *)buf,"Upgrade: websocket")){
+        char *key_ptr = strstr((char *)buf,"Sec-WebSocket-Key:");
+        if (!key_ptr) return;
+        key_ptr += 19;
+        printf("HANDSHAKE REQUEST \n");
+        char client_key[256] = {0};
+        sscanf(key_ptr, "%255[^\r\n]", client_key);
+        char accept_key[128];
+        generate_websocket_accept_key(client_key, accept_key);
+        char resp[512];
+        snprintf(resp, sizeof(resp),
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Accept: %s\r\n"
+            "\r\n",
+            accept_key);
+        send(p->player_fd, resp, strlen(resp), 0);
+        printf("Handshake completed: %d\n\n", p->player_fd);
+        p->handshake_done = 1;
+        enqueue_player(p);
+        char msg[] = "{\"type\":\"connected\",\"symbol\":\"Waiting for opponent player ...\"}";
+        send_text_frame(p->player_fd, msg);
+        match_players(); 
+        return;
+    }
+}
+
+void handle_game_message(Player *p, char *buf, int mask_offset, unsigned long payload_len){
+    unsigned char masking_key[4];
+    memcpy(masking_key, &buf[mask_offset], 4);
+    unsigned char *payload = &buf[mask_offset + 4];
+    char decoded[BUF_SIZE];
+    for (unsigned long j = 0; j < payload_len; j++) {
+        decoded[j] = payload[j] ^ masking_key[j % 4];
+    }
+    decoded[payload_len] = '\0';
+    char *msg = strndup((char*)decoded, payload_len);
+    if (!msg)
+        return;
+    Game *game = p->game;
+    if (!game){
+        free(msg);
+        return;
+    }
+    if (strstr(msg, "\"type\":\"move\"")){
+        int pos = -1;
+        sscanf(msg, "{\"type\":\"move\",\"position\":%d}", &pos);
+        if (!game->game_over && pos >= 0 && pos < 9 && game->board[pos] == ' ' && p->symbol == game->current_turn){
+            game->board[pos] = p->symbol;
+            broadcast_board(game);
+            char winner = check_winner(game);
+            if (winner != ' '){
+                game->game_over = 1;
+                char result_msg[128];
+                snprintf(result_msg, sizeof(result_msg), "{\"type\":\"result\",\"message\":\"Winner is %c\"}", winner);
+                send_text_frame(game->player1->player_fd, result_msg);
+                send_text_frame(game->player2->player_fd, result_msg);
+            }
+            else if (is_draw(game)){
+                game->game_over = 1;
+                char draw_msg[] = "{\"type\":\"result\",\"message\":\"Match Draw\"}";
+                send_text_frame(game->player1->player_fd, draw_msg);
+                send_text_frame(game->player2->player_fd, draw_msg);
+            }
+            game->current_turn = (game->current_turn == 'X') ? 'O' : 'X';
+        }
+    }
+    else if (strstr(msg, "\"type\":\"reset\"")){
+        for (int i = 0; i < 9; i++)
+            game->board[i] = ' ';
+        game->current_turn = 'X';
+        game->game_over = 0;
+        broadcast_board(game);
+        char reset_msg[] = "{\"type\":\"reset\"}";
+        send_text_frame(game->player1->player_fd, reset_msg);
+        send_text_frame(game->player2->player_fd, reset_msg);
+    }
+    free(msg);
+    return;
+}
+
+void handle_websocket_frame(Player *p, unsigned char *buf, int n, int epfd){
+    unsigned char byte1 = buf[0];
+    unsigned char byte2 = buf[1];
+    int opcode = byte1 & 0x0F;
+    int mask = (byte2 >> 7) & 1;
+    unsigned long payload_len = byte2 & 0x7F;
+    int mask_offset;
+    if (payload_len == 126) {
+        payload_len = (buf[2] << 8) | buf[3];
+        mask_offset = 4;
+    }
+    else if (payload_len == 127) {
+        return;
+    }
+    else {
+        mask_offset = 2;
+    }
+    if (opcode == 0x8 && mask == 1) {
+        handle_disconnect(p, epfd);
+        return;
+    }
+    else if(opcode == 0x1 && mask == 1){
+        handle_game_message(p, buf, mask_offset, payload_len);
+        return;
+    }
+}
+
+void handle_client_event(Player *p, int epfd)
+{
+    unsigned char buf[BUF_SIZE];
+    int n = recv(p->player_fd, buf, BUF_SIZE, 0);
+    if (n <= 0) {
+        handle_disconnect(p, epfd);
+        return;
+    }
+    if (!p->handshake_done) {
+        handle_handshake(p, buf);
+    } else {
+        handle_websocket_frame(p, buf, n, epfd);
+    }
 }
 
 int main(void)
@@ -249,10 +461,12 @@ int main(void)
     make_socket_non_blocking(sockfd);
 
     epfd = epoll_create1(0);
-
+    Listener *listener = malloc(sizeof(Listener));
+    listener->type = EVENT_LISTENER;
+    listener->sockfd = sockfd;
     ev.events = EPOLLIN;
-    ev.data.fd = sockfd;
-    epoll_ctl(epfd, EPOLL_CTL_ADD, sockfd, &ev);
+    ev.data.ptr = listener;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, sockfd, &ev);            
 
     printf("Tic Tac Toe server running on port %s\n", PORT);
 
@@ -261,230 +475,28 @@ int main(void)
 
         for (int i = 0; i < nfds; i++) {
 
-            if (events[i].data.fd == sockfd) {
-
-                while (1) {
-                    struct sockaddr_storage client_addr;
-                    socklen_t addr_len = sizeof client_addr;
-                    int client_fd = accept(sockfd, (struct sockaddr *)&client_addr, &addr_len);
-
-                    if (client_fd == -1) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK)
-                            break;
-                        else {
-                            perror("accept");
-                            break;
-                        }
-                    }
-
-                    make_socket_non_blocking(client_fd);
-
-                    ev.events = EPOLLIN;
-                    ev.data.fd = client_fd;
-                    epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &ev);
-
-                    handshake_done[client_fd] = 0;
-
-                    printf("New client connected: %d\n\n", client_fd);
-
-                    Player *p = malloc(sizeof(Player));
-                    memset(p, 0, sizeof(Player));
-                    
-                    players[client_fd] = p;
-                    p->player_fd = client_fd;
-                    p->game = NULL;
-                    p->symbol = ' ';
-                    p->enqueued = 0;
-                }
+            void *ptr = events[i].data.ptr;
+            int type = *((int*)ptr);
+            if (type == EVENT_LISTENER) {
+                Listener *l = ptr;
+                accept_connections(l->sockfd, epfd);
             }
-            else {
-
-                int client_fd = events[i].data.fd;
-                unsigned char buf[BUF_SIZE];
-
-                int n = recv(client_fd, buf, BUF_SIZE, 0);
-
-                if (n <= 0) {
-                    Player *p = players[client_fd];
-                    if (p) {
-                        if (p->game) {
-                            Game *g = p->game;
-                            Player *opponent = (g->player1 == p) ? g->player2 : g->player1;
-                            if (opponent) {
-                                send_text_frame(opponent->player_fd, "{\"type\":\"opponent_left\"}");
-                                opponent->game = NULL;
-                                opponent->symbol = ' ';
-                            }
-                            remove_game(g);
-                            free(g);
-                        }
-                        remove_from_queue(p);
-                        free(p);
-                        players[client_fd] = NULL;
-                    }
-                    epoll_ctl(epfd, EPOLL_CTL_DEL, client_fd, NULL);
-                    handshake_done[client_fd] = 0;
-                    close(client_fd);
-                    continue;
-                }
-                
-                if (!handshake_done[client_fd]) 
-                {
-                    if (strstr((char *)buf,"Connection: Upgrade") &&
-                        strstr((char *)buf,"Upgrade: websocket"))
-                    {
-                        char *key_ptr = strstr((char *)buf,"Sec-WebSocket-Key:");
-                        if (!key_ptr) continue;
-
-                        key_ptr += 19;
-
-                        printf("HANDSHAKE REQUEST \n");
-
-                        char client_key[256] = {0};
-                        sscanf(key_ptr, "%255[^\r\n]", client_key);
-
-                        char accept_key[128];
-                        generate_websocket_accept_key(client_key, accept_key);
-
-                        char resp[512];
-                        snprintf(resp, sizeof(resp),
-                            "HTTP/1.1 101 Switching Protocols\r\n"
-                            "Upgrade: websocket\r\n"
-                            "Connection: Upgrade\r\n"
-                            "Sec-WebSocket-Accept: %s\r\n"
-                            "\r\n",
-                            accept_key);
-
-                        send(client_fd, resp, strlen(resp), 0);
-
-                        printf("Handshake completed: %d\n\n", client_fd);
-
-                        handshake_done[client_fd] = 1;
-                        Player *p = players[client_fd];
-                        enqueue_player(p);
-                        char msg[] = "{\"type\":\"connected\",\"symbol\":\"Waiting for opponent player ...\"}";
-                        send_text_frame(p->player_fd, msg);
-                        match_players(); 
-                        continue;
-                    }
-                }
-                else 
-                {
-                    unsigned char byte1 = buf[0];
-                    unsigned char byte2 = buf[1];
-
-                    int opcode = byte1 & 0x0F;
-                    int mask = (byte2 >> 7) & 1;
-                    unsigned long payload_len = byte2 & 0x7F;
-                    int mask_offset;
-
-                    if (payload_len == 126) {
-                        payload_len = (buf[2] << 8) | buf[3];
-                        mask_offset = 4;
-                    }
-                    else if (payload_len == 127) {
-                        continue;
-                    }
-                    else {
-                        mask_offset = 2;
-                    }
-
-                    if (opcode == 0x8) {
-                        Player *p = players[client_fd];
-                        if (p) {
-                            if (p->game) {
-                                Game *g = p->game;
-                                Player *opponent = (g->player1 == p) ? g->player2 : g->player1;
-                                if (opponent) {
-                                    send_text_frame(opponent->player_fd, "{\"type\":\"opponent_left\"}");
-                                    opponent->game = NULL;
-                                    opponent->symbol = ' ';
-                                    enqueue_player(opponent);
-                                }
-                                remove_game(g);
-                                free(g);
-                                match_players();
-                            }
-                            remove_from_queue(p);
-                            players[client_fd] = NULL;
-                            free(p);
-                        }
-                        epoll_ctl(epfd, EPOLL_CTL_DEL, client_fd, NULL);
-                        close(client_fd);
-                        handshake_done[client_fd] = 0;
-                        continue;
-                    }
-
-                    if (opcode == 0x1 && mask == 1) {
-
-                        unsigned char masking_key[4];
-                        memcpy(masking_key, &buf[mask_offset], 4);
-
-                        unsigned char *payload = &buf[mask_offset + 4];
-
-                        char decoded[BUF_SIZE];
-                        for (unsigned long j = 0; j < payload_len; j++) {
-                            decoded[j] = payload[j] ^ masking_key[j % 4];
-                        }
-                        decoded[payload_len] = '\0';
-
-                        Player *p = players[client_fd];
-                        char *msg = strndup((char*)decoded, payload_len);
-                        if (!msg)
-                            break;
-                        Game *game = p->game;
-                        if (!game) 
-                        {
-                            free(msg);
-                            break;
-                        }
-                        if (strstr(msg, "\"type\":\"move\"")) 
-                        {
-                            int pos = -1;
-                            sscanf(msg, "{\"type\":\"move\",\"position\":%d}", &pos);
-                            if (!game->game_over && pos >= 0 && pos < 9 && game->board[pos] == ' ' && p->symbol == game->current_turn)
-                            {
-                                game->board[pos] = p->symbol;
-                                broadcast_board(game);
-                                char winner = check_winner(game);
-                                if (winner != ' ')
-                                {
-                                    game->game_over = 1;
-                                    char result_msg[128];
-                                    snprintf(result_msg, sizeof(result_msg), "{\"type\":\"result\",\"message\":\"Winner is %c\"}", winner);
-                                    send_text_frame(game->player1->player_fd, result_msg);
-                                    send_text_frame(game->player2->player_fd, result_msg);
-                                    
-                                }
-                                else if (is_draw(game))
-                                {
-                                    game->game_over = 1;
-                                    char draw_msg[] = "{\"type\":\"result\",\"message\":\"Match Draw\"}";
-                                    send_text_frame(game->player1->player_fd, draw_msg);
-                                    send_text_frame(game->player2->player_fd, draw_msg);
-                                    
-                                }
-                                game->current_turn = (game->current_turn == 'X') ? 'O' : 'X';
-                            }
-                        }
-                        else if (strstr(msg, "\"type\":\"reset\""))
-                        {
-                            for (int i = 0; i < 9; i++)
-                                game->board[i] = ' ';
-                            game->current_turn = 'X';
-                            game->game_over = 0;
-                            broadcast_board(game);
-                            char reset_msg[] = "{\"type\":\"reset\"}";
-                            send_text_frame(game->player1->player_fd, reset_msg);
-                            send_text_frame(game->player2->player_fd, reset_msg);
-                        }
-                        free(msg);
-                    }
-                }
+            else if (type == EVENT_PLAYER) {
+                Player *p = ptr;
+                handle_client_event(p, epfd);
             }
+            else if (type == EVENT_TIMER) {
+                TimerEvent *te = ptr;
+                uint64_t exp;
+                read(te->timer_fd, &exp, sizeof(exp));
+                enqueue_player(te->player);
+                match_players();
+                epoll_ctl(epfd, EPOLL_CTL_DEL, te->timer_fd, NULL);
+                close(te->timer_fd);
+                free(te);
+             }
         }
     }
-
     close(sockfd);
     freeaddrinfo(res);
     return 0;
