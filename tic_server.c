@@ -17,7 +17,6 @@
 #define MAX_EVENTS 1000
 #define BUF_SIZE 1000
 #define BACKLOG 100
-#define MAX_ALLOWED 8000
 #define EVENT_LISTENER 0
 #define EVENT_PLAYER 1
 #define EVENT_TIMER  2
@@ -260,8 +259,6 @@ void accept_connections(int sockfd, int epfd){
 
 void handle_disconnect(Player *p, int epfd){
     
-    if (!p)
-        return;
     if (p->game) {
         Game *g = p->game;
         Player *opponent = (g->player1 == p) ? g->player2 : g->player1;
@@ -395,9 +392,6 @@ void handle_websocket_frame(Player *p, unsigned char *buf, int n, int epfd){
         payload_len = (buf[2] << 8) | buf[3];
         mask_offset = 4;
     }
-    else if (payload_len == 127) {
-        return;
-    }
     else {
         mask_offset = 2;
     }
@@ -421,7 +415,8 @@ void handle_client_event(Player *p, int epfd)
     }
     if (!p->handshake_done) {
         handle_handshake(p, buf);
-    } else {
+    } 
+    else {
         handle_websocket_frame(p, buf, n, epfd);
     }
 }
@@ -432,7 +427,7 @@ int main(void)
     struct addrinfo hints, *res, *p;
     struct epoll_event ev, events[MAX_EVENTS];
     memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_UNSPEC;
+    hints.ai_family = AF_INET6;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
 
