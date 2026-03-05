@@ -1,6 +1,6 @@
 let playerSymbol = '';
 let clearmessage = false;
-const socket = new WebSocket("wss://f527-2409-40f4-3103-f44e-124c-1509-8941-b1b0.ngrok-free.app");
+const socket = new WebSocket("ws://localhost:8080");
 const cells = document.querySelectorAll('.cell');
 
 socket.onopen = function() {
@@ -28,6 +28,7 @@ socket.onmessage = function(event) {
     if (data.type === "reset") {
     clearBoard();
     document.getElementById("message").textContent = "Player X should start";
+    clearmessage = true; 
     }
     if (data.type === "opponent_left") {
     document.getElementById("message").textContent = "";
